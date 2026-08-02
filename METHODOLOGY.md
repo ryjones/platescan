@@ -251,6 +251,15 @@ them would read as "not seen". A KMZ can also be rebuilt from a previous run's
 JSON without rescanning, taking positions from the per-sighting fixes the
 report recorded.
 
+**HTML map.** Google Earth's web and mobile viewers refuse balloon images
+that are not public https URLs — they will not read them out of the KMZ
+archive, and hosting plate crops publicly is what an evidence workflow must
+not do. `--html` therefore writes the same content as a single Leaflet page:
+routes and markers with the crops embedded as base64 data URIs, built from
+the same in-memory model as the KMZ. The page fetches only the Leaflet
+library and OpenStreetMap tiles; the plate data itself never leaves the
+file.
+
 ## 9. Trips
 
 `--by-trip` (implied by a directory input) groups clips into trips before

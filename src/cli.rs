@@ -29,6 +29,14 @@ pub struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
     pub kmz: Option<PathBuf>,
 
+    /// Also write a self-contained interactive map: one HTML file with a
+    /// marker per sighting and the crop embedded, viewable in any browser —
+    /// unlike a KMZ, whose images Google Earth's web viewer will not show.
+    /// The path is optional (--html=path) and defaults to the report's name.
+    /// Accepts a --json report as the input, like --kmz.
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
+    pub html: Option<PathBuf>,
+
     /// Group the inputs into trips — runs of clips whose recordings are
     /// contiguous — and write one consolidated report per trip. Front and
     /// rear clips recorded together land in the same trip. --out names a

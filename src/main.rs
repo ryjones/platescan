@@ -3,6 +3,7 @@ mod cli;
 mod clip;
 mod frames;
 mod gps;
+mod html;
 mod kml;
 mod ocr;
 mod plate;
@@ -52,17 +53,30 @@ fn main() -> Result<()> {
         for input in &cli.inputs {
             clips.extend(kml::from_json(input)?);
         }
-        let wanted = match cli.kmz.as_deref().filter(|p| !kmz_is_auto(p)) {
-            Some(p) => p.to_path_buf(),
-            None => cli.inputs[0].with_extension("kmz"),
+        let resolve = |p: Option<&Path>, ext: &str| {
+            let wanted = match p.filter(|p| !path_is_auto(p)) {
+                Some(p) => p.to_path_buf(),
+                None => cli.inputs[0].with_extension(ext),
+            };
+            if cli.force {
+                wanted
+            } else {
+                next_free_path(&wanted)
+            }
         };
-        let out = if cli.force {
-            wanted
-        } else {
-            next_free_path(&wanted)
-        };
-        kml::write_kmz(&out, &clips)?;
-        report_kmz(&out, &clips, cli.quiet);
+        if let Some(html) = &cli.html {
+            let out = resolve(Some(html), "html");
+            html::write_html(&out, &clips)?;
+            report_export("marker", &out, &clips);
+        }
+        // A JSON input with no format asked for means KMZ, the original
+        // behaviour of this mode.
+        if cli.kmz.is_some() || cli.html.is_none() {
+            let out = resolve(cli.kmz.as_deref(), "kmz");
+            kml::write_kmz(&out, &clips)?;
+            report_export("placemark", &out, &clips);
+        }
+        warn_unplaced(&clips, cli.quiet);
         return Ok(());
     }
 
@@ -125,7 +139,17 @@ fn main() -> Result<()> {
             // rebuilt from the report without a rescan.
             let json_path = Some(out_path.with_extension("json"));
             let kmz_path = cli.kmz.is_some().then(|| out_path.with_extension("kmz"));
-            run_batch(trip, &cli, &rules, &out_path, json_path, kmz_path, Some(&cache))?;
+            let html_path = cli.html.is_some().then(|| out_path.with_extension("html"));
+            run_batch(
+                trip,
+                &cli,
+                &rules,
+                &out_path,
+                json_path,
+                kmz_path,
+                html_path,
+                Some(&cache),
+            )?;
         }
         return Ok(());
     }
@@ -140,19 +164,25 @@ fn main() -> Result<()> {
             next_free_path(p)
         }
     });
-    let kmz_path = cli.kmz.as_ref().map(|p| {
-        let wanted = if kmz_is_auto(p) {
-            out_path.with_extension("kmz")
-        } else {
-            p.clone()
-        };
-        if cli.force {
-            wanted
-        } else {
-            next_free_path(&wanted)
-        }
-    });
-    run_batch(&clips, &cli, &rules, &out_path, json_path, kmz_path, None)
+    let side_path = |given: Option<&Path>, ext: &str| {
+        given.map(|p| {
+            let wanted = if path_is_auto(p) {
+                out_path.with_extension(ext)
+            } else {
+                p.to_path_buf()
+            };
+            if cli.force {
+                wanted
+            } else {
+                next_free_path(&wanted)
+            }
+        })
+    };
+    let kmz_path = side_path(cli.kmz.as_deref(), "kmz");
+    let html_path = side_path(cli.html.as_deref(), "html");
+    run_batch(
+        &clips, &cli, &rules, &out_path, json_path, kmz_path, html_path, None,
+    )
 }
 
 /// Findings from previous runs, indexed by clip stem so a clip that was
@@ -206,9 +236,10 @@ impl ReportCache {
     }
 }
 
-/// Scan a set of clips into one consolidated report, with optional JSON and
-/// KMZ beside it. Clips covered by the cache reuse their previous findings
-/// instead of being scanned.
+/// Scan a set of clips into one consolidated report, with optional JSON,
+/// KMZ and HTML map beside it. Clips covered by the cache reuse their
+/// previous findings instead of being scanned.
+#[allow(clippy::too_many_arguments)]
 fn run_batch(
     clips: &[Clip],
     cli: &Cli,
@@ -216,6 +247,7 @@ fn run_batch(
     out_path: &Path,
     json_path: Option<PathBuf>,
     kmz_path: Option<PathBuf>,
+    html_path: Option<PathBuf>,
     cache: Option<&ReportCache>,
 ) -> Result<()> {
     let crop_dir = (!cli.no_crops).then(|| crop_dir(cli, out_path));
@@ -263,22 +295,28 @@ fn run_batch(
     if let Some(json) = &json_path {
         report::write_json(json, &reports)?;
     }
-    let kmz_clips = match &kmz_path {
-        Some(kmz) => {
-            let kclips = kml::from_reports(&reports);
-            kml::write_kmz(kmz, &kclips)?;
-            Some(kclips)
-        }
-        None => None,
-    };
+    let exports = (kmz_path.is_some() || html_path.is_some())
+        .then(|| kml::from_reports(&reports));
+    if let (Some(kmz), Some(kclips)) = (&kmz_path, &exports) {
+        kml::write_kmz(kmz, kclips)?;
+    }
+    if let (Some(html), Some(kclips)) = (&html_path, &exports) {
+        html::write_html(html, kclips)?;
+    }
 
     let total: usize = reports.iter().map(|r| r.sightings.len()).sum();
     println!("{total} plate sighting(s) -> {}", out_path.display());
     if let Some(json) = &json_path {
         println!("raw findings -> {}", json.display());
     }
-    if let (Some(kmz), Some(kclips)) = (&kmz_path, &kmz_clips) {
-        report_kmz(kmz, kclips, cli.quiet);
+    if let Some(kclips) = &exports {
+        if let Some(kmz) = &kmz_path {
+            report_export("placemark", kmz, kclips);
+        }
+        if let Some(html) = &html_path {
+            report_export("marker", html, kclips);
+        }
+        warn_unplaced(kclips, cli.quiet);
     }
     Ok(())
 }
@@ -351,16 +389,19 @@ fn trip_stem(trip: &[Clip]) -> String {
     }
 }
 
-/// Summary line for a KMZ built from a JSON report, with a warning for any
-/// sightings that could not be placed.
-fn report_kmz(path: &Path, clips: &[kml::KmlClip], quiet: bool) {
+/// Summary line for a map export.
+fn report_export(noun: &str, path: &Path, clips: &[kml::KmlClip]) {
     let placed: usize = clips.iter().map(|c| c.placemarks.len()).sum();
-    let unplaced: usize = clips.iter().map(|c| c.unplaced).sum();
     println!(
-        "{placed} placemark(s) from {} clip(s) -> {}",
+        "{placed} {noun}(s) from {} clip(s) -> {}",
         clips.len(),
         path.display()
     );
+}
+
+/// One warning, however many export formats were written.
+fn warn_unplaced(clips: &[kml::KmlClip], quiet: bool) {
+    let unplaced: usize = clips.iter().map(|c| c.unplaced).sum();
     if unplaced > 0 && !quiet {
         eprintln!(
             "warning: {unplaced} sighting(s) had no GPS fix and are not on the map"
@@ -609,9 +650,9 @@ fn probe_all(inputs: &[PathBuf], cli: &Cli, lenient: bool) -> Result<Vec<Clip>> 
     Ok(probed.into_iter().flatten().collect())
 }
 
-/// A bare `--kmz` parses as the sentinel `auto`, meaning "derive the path
-/// from the report".
-fn kmz_is_auto(p: &Path) -> bool {
+/// A bare `--kmz` or `--html` parses as the sentinel `auto`, meaning
+/// "derive the path from the report".
+fn path_is_auto(p: &Path) -> bool {
     p.as_os_str().is_empty() || p == Path::new("auto")
 }
 

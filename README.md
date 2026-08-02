@@ -109,6 +109,23 @@ platescan reports/clip-plates.json --kmz clip.kmz     # --kmz optional here
 Sightings with no fix (no GPS and no borrowable pair) are left off the map,
 with a warning saying how many.
 
+Note that Google Earth's **web and mobile** viewers will not show balloon
+images from inside a KMZ — they only fetch public https URLs, which is
+exactly where plate crops should not live. Open KMZs in Google Earth Pro
+(desktop), or use `--html` instead.
+
+## Browser map
+
+`--html` writes a self-contained interactive map that opens in any browser:
+each clip's route on OpenStreetMap, a marker per sighting, and the crop
+embedded in the popup as a data URI, so the plate data never leaves the
+file. It takes the same inputs as `--kmz`, including a previous run's
+`--json` report:
+
+```
+platescan reports/clip-plates.json --html
+```
+
 ## Trips
 
 `--by-trip` turns a pile of clips into one consolidated report per drive:
@@ -239,6 +256,7 @@ every frame. The default region of interest excludes the bottom of the frame;
 | `-j`, `--jobs` | cores - 1 | Parallel workers |
 | `--json` | - | Also write raw findings as JSON |
 | `--kmz` | - | Also write a Google Earth KMZ with embedded crops; takes a `--json` report as input to skip rescanning |
+| `--html` | - | Also write a self-contained browser map with embedded crops; same inputs as `--kmz` |
 | `--by-trip` | off | One consolidated report per contiguous run of clips; `--out` becomes a directory |
 | `--trip-gap` | `90` | Seconds of camera-off that still counts as the same trip |
 | `--no-crops` | off | Skip saving verification stills |
