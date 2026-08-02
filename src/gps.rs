@@ -118,6 +118,49 @@ impl Track {
         self.fixes.iter().flatten().next()
     }
 
+    /// Every fix in clip order, for tracing the route.
+    pub fn points(&self) -> impl Iterator<Item = &Fix> {
+        self.fixes.iter().flatten()
+    }
+
+    /// Rebuild a sparse track from per-sighting fixes recovered out of an
+    /// old report, for when the source clip is no longer reachable. Only
+    /// the seconds a sighting was recorded at carry a fix; `nearest`
+    /// bridges the gaps around them.
+    pub fn from_sparse(fixes_at: Vec<(f64, Fix)>, duration: f64) -> Option<Track> {
+        if fixes_at.is_empty() {
+            return None;
+        }
+        let len = (duration.ceil() as usize).max(
+            fixes_at
+                .iter()
+                .map(|(o, _)| o.round() as usize)
+                .max()
+                .unwrap_or(0),
+        ) + 1;
+        let mut fixes = vec![None; len];
+        for (offset, fix) in fixes_at {
+            if offset >= 0.0 {
+                fixes[(offset.round() as usize).min(len - 1)] = Some(fix);
+            }
+        }
+        Some(Track { fixes })
+    }
+
+    /// This track as seen from a clip that started `delta` seconds later.
+    /// Front and rear cameras roll together but only the front records GPS,
+    /// so the rear clip reads the front clip's track through this shift.
+    pub fn shifted(&self, delta: i64) -> Track {
+        let fixes = (0..self.fixes.len() as i64)
+            .map(|i| {
+                usize::try_from(i + delta)
+                    .ok()
+                    .and_then(|j| self.fixes.get(j).copied().flatten())
+            })
+            .collect();
+        Track { fixes }
+    }
+
     /// The first valid fix together with the clip second it sits at. A receiver
     /// that starts without a lock can leave the opening minutes empty, so the
     /// index cannot be assumed to be zero.
@@ -328,6 +371,28 @@ mod tests {
         assert!(track.at(1.0).is_none(), "no fix at that second");
         assert!(track.nearest(1.0).is_some(), "falls back to a neighbour");
         assert_eq!(track.fix_count(), 2);
+    }
+
+    #[test]
+    fn shifting_aligns_a_borrowed_track() {
+        let donor = Track {
+            fixes: vec![
+                Some(fix(at(20, 0, 0))),
+                Some(fix(at(20, 0, 1))),
+                None,
+                Some(fix(at(20, 0, 3))),
+            ],
+        };
+        // The borrowing clip started two seconds after the donor: its second
+        // zero is the donor's second two.
+        let later = donor.shifted(2);
+        assert!(later.at(0.0).is_none(), "donor had no lock at that second");
+        assert_eq!(later.at(1.0).map(|f| f.time), Some(at(20, 0, 3)));
+        assert_eq!(later.fix_count(), 1);
+        // Started one second before the donor: nothing covers second zero.
+        let earlier = donor.shifted(-1);
+        assert!(earlier.at(0.0).is_none());
+        assert_eq!(earlier.at(1.0).map(|f| f.time), Some(at(20, 0, 0)));
     }
 
     #[test]

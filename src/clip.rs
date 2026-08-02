@@ -35,6 +35,8 @@ pub struct Clip {
     pub duration: f64,
     /// GPS fixes embedded by the camera, when it recorded any.
     pub gps: Option<crate::gps::Track>,
+    /// The track came from a paired clip rather than this file.
+    pub gps_borrowed: bool,
     /// Minutes to add to UTC for the camera's local time, inferred from GPS.
     pub utc_offset_minutes: Option<i32>,
 }
@@ -66,8 +68,42 @@ impl Clip {
             fps: meta.fps,
             duration: meta.duration,
             gps,
+            gps_borrowed: false,
             utc_offset_minutes,
         })
+    }
+
+    /// Fill a missing track from a clip recorded at the same moment by the
+    /// other camera. Rear cameras write no GPS of their own, but the front
+    /// camera rolled through the same seconds of driving. Clips scanned in
+    /// the same run are tried first, then the file's own folder.
+    pub fn borrow_gps(&mut self, donors: &[Clip]) {
+        if self.gps.is_some() {
+            return;
+        }
+        let Some(start) = self.start else { return };
+        let mut best: Option<(i64, &crate::gps::Track)> = None;
+        for d in donors {
+            let (Some(track), Some(d_start)) = (d.gps.as_ref(), d.start) else {
+                continue;
+            };
+            let delta = (start - d_start).num_seconds();
+            if delta.abs() as f64 > d.duration.max(self.duration) {
+                continue;
+            }
+            if best.is_none_or(|(b, _)| delta.abs() < b.abs()) {
+                best = Some((delta, track));
+            }
+        }
+        let track = best
+            .map(|(delta, t)| t.shifted(delta))
+            .filter(|t| t.fix_count() > 0)
+            .or_else(|| sibling_track(&self.path, start, self.duration));
+        if let Some(track) = track {
+            self.utc_offset_minutes = track.utc_offset_minutes(start);
+            self.gps = Some(track);
+            self.gps_borrowed = true;
+        }
     }
 
     /// Local wall-clock time of an offset into the clip.
@@ -102,6 +138,61 @@ impl Clip {
     pub fn fix_at(&self, offset: f64) -> Option<&crate::gps::Fix> {
         self.gps.as_ref()?.nearest(offset)
     }
+}
+
+/// The GPS track covering a clip at `path`: its own when it recorded one,
+/// otherwise a paired clip's from the same folder, shifted into this clip's
+/// timeline.
+pub fn disk_track(
+    path: &Path,
+    start: Option<NaiveDateTime>,
+    duration: f64,
+) -> Option<crate::gps::Track> {
+    if let Ok(Some(track)) = crate::gps::Track::read(path) {
+        return Some(track);
+    }
+    sibling_track(path, start?, duration)
+}
+
+/// Search the clip's folder for another clip whose recording overlaps this
+/// one and carries GPS. Overlap is judged from the file-name stamps, which
+/// both cameras take from the same clock; a clip from a different moment
+/// yields no overlapping fixes and is rejected after the shift.
+fn sibling_track(path: &Path, start: NaiveDateTime, duration: f64) -> Option<crate::gps::Track> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let own_stem = path.file_stem();
+    let mut candidates: Vec<(i64, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if !p
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+            || p.file_stem() == own_stem
+        {
+            continue;
+        }
+        let Some(other_start) = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| parse_name(s).and_then(|n| n.start))
+        else {
+            continue;
+        };
+        let delta = (start - other_start).num_seconds();
+        if (delta.abs() as f64) < duration.max(1.0) {
+            candidates.push((delta, p));
+        }
+    }
+    candidates.sort_by_key(|(delta, _)| delta.abs());
+    // Reading a track is one seek through the box tree, but there is no point
+    // trying every clip in a large folder.
+    candidates.into_iter().take(4).find_map(|(delta, p)| {
+        let track = crate::gps::Track::read(&p).ok().flatten()?.shifted(delta);
+        (track.fix_count() > 0).then_some(track)
+    })
 }
 
 struct NameParts {

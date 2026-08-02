@@ -21,11 +21,13 @@ clip.MP4
                                         │
                                         ├─ 5. track   ─► group into vehicles
                                         ├─ 6. coalesce ─► reunite split tracks
-                                        └─ 7. report  ─► Markdown + JSON
+                                        └─ 7. report  ─► Markdown + JSON + KMZ
 ```
 
 Stages 1–4 run per frame across a worker pool. Stages 5–7 run once, over the
-pooled detections.
+pooled detections. Directory inputs add a grouping stage in front (one report
+per trip, §9) and a reuse stage (clips with existing findings skip stages 1–7
+entirely, §10).
 
 ---
 
@@ -77,6 +79,25 @@ necessarily at second zero.
 Timestamps then come from the satellites, falling back to file-name arithmetic
 for stretches with no fix. Verified against this footage: GPS position matched
 the camera's burned-in overlay exactly, while its clock ran 3 s ahead of it.
+
+**Borrowed tracks.** Rear cameras write no GPS of their own, but the front
+camera rolled through the same seconds of driving, so a clip without a track
+borrows one: first from a clip scanned in the same run, then from a clip found
+beside it on disk whose file-name stamp overlaps its recording window. The
+donor's per-second fixes are shifted by the difference between the two start
+stamps — both cameras stamp from the same clock, so the deltas are consistent —
+and a candidate whose shifted track has no overlapping fixes is rejected, which
+is what stops the *previous* ten-minute clip (whose stamp is also "nearby")
+from donating an empty track. Borrowed tracks are marked as such in the
+report: the positions are the recording vehicle's, which is correct for both
+cameras, but the provenance should be visible in evidence.
+
+**Probing an archive.** Reading a track is ffprobe plus several hundred
+scattered 96-byte reads through `mdat`, which is seek-latency, not bandwidth.
+Probing clips one at a time left the machine near-idle for minutes on a
+280-clip archive, so probes run on a small worker pool to overlap the seeks.
+For directory inputs an unreadable clip is skipped with a warning rather than
+aborting the run — one corrupt file should not cost an archive scan.
 
 ## 2. Frame sampling
 
@@ -217,6 +238,46 @@ still.
 
 Reruns never overwrite: the report is written beside any existing one as
 `-2`, `-3`, … unless `--force` is given.
+
+**KMZ.** `--kmz` adds a Google Earth file: a zip holding `doc.kml` plus the
+verification crops under `files/` — KMZ rather than KML because it is the only
+form Google Earth accepts with images embedded. Each sighting becomes a
+placemark at the GPS fix of its *best* reading (that is the frame the embedded
+crop came from, so the pin marks where the photo was taken), with a UTC
+`TimeStamp` for Earth's time slider and the sighting's statistics in the
+balloon. Each clip's fixes are also traced as a route line. Sightings with no
+fix are left off the map, with a warning saying how many — silently dropping
+them would read as "not seen". A KMZ can also be rebuilt from a previous run's
+JSON without rescanning, taking positions from the per-sighting fixes the
+report recorded.
+
+## 9. Trips
+
+`--by-trip` (implied by a directory input) groups clips into trips before
+scanning. Clips are sorted by wall-clock start and chained: a clip joins the
+current trip if it starts within `--trip-gap` seconds of the trip's furthest
+recording end, else it opens a new one. Front and rear clips recorded together
+share their start stamps, so they chain into the same trip without being
+paired explicitly. A clip whose name yields no timestamp cannot chain and
+becomes a trip of its own. Each trip is scanned as one consolidated report —
+Markdown, raw JSON (always, see §10), crops, and optionally KMZ — named after
+the trip's start time.
+
+## 10. Reuse
+
+In trip mode, every platescan JSON already in the output directory is indexed
+by clip stem, and a clip found in the index is never rescanned: its report is
+reconstructed from the JSON instead. Stills are reloaded from the crop files
+beside the old report; the GPS track is re-read from the source clip when it
+is still reachable (including the borrowing of §1), and otherwise reassembled
+sparsely from the per-sighting fixes the report recorded, which is enough to
+place sightings and draw what was seen. The scan parameters echoed into a
+consolidated report are per-clip, so a trip mixing cached and fresh clips
+still records how each clip was actually scanned.
+
+The consequence to know about: cached findings win over new settings. To
+rescan a clip at, say, a higher sample rate, delete or move the JSON that
+covers it first.
 
 ---
 

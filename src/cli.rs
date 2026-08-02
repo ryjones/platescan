@@ -7,7 +7,9 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(name = "platescan", version, about, long_about = None)]
 pub struct Cli {
-    /// Video files to scan (e.g. 2026_0801_131218_000289F.MP4)
+    /// Video files to scan (e.g. 2026_0801_131218_000289F.MP4), directories
+    /// of them (scanned recursively, and grouped into trips), or a previous
+    /// run's --json report to rebuild a KMZ without rescanning
     #[arg(required = true)]
     pub inputs: Vec<PathBuf>,
 
@@ -18,6 +20,27 @@ pub struct Cli {
     /// Also write raw findings as JSON
     #[arg(long)]
     pub json: Option<PathBuf>,
+
+    /// Also write a Google Earth KMZ: one placemark per sighting, positioned
+    /// from the GPS track, with the verification crop embedded. The path is
+    /// optional (--kmz=path to set it) and defaults to the report's name.
+    /// To build one from a previous run without rescanning, pass that run's
+    /// --json report as the input instead of a video.
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto", require_equals = true)]
+    pub kmz: Option<PathBuf>,
+
+    /// Group the inputs into trips — runs of clips whose recordings are
+    /// contiguous — and write one consolidated report per trip. Front and
+    /// rear clips recorded together land in the same trip. --out names a
+    /// directory in this mode, and raw JSON findings are always written so
+    /// a KMZ can be rebuilt later without rescanning.
+    #[arg(long)]
+    pub by_trip: bool,
+
+    /// Seconds the camera may be off between clips that still count as the
+    /// same trip (--by-trip)
+    #[arg(long, default_value_t = 90.0)]
+    pub trip_gap: f64,
 
     /// Recognition backend
     #[arg(long, value_enum, default_value_t = EngineKind::Alpr)]
@@ -230,6 +253,9 @@ impl Cli {
         }
         if self.psm > 13 {
             bail!("--psm must be 0..=13");
+        }
+        if self.trip_gap <= 0.0 {
+            bail!("--trip-gap must be positive");
         }
         Ok(())
     }

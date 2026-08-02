@@ -3,6 +3,7 @@ mod cli;
 mod clip;
 mod frames;
 mod gps;
+mod kml;
 mod ocr;
 mod plate;
 mod report;
@@ -33,6 +34,38 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     cli.validate()?;
 
+    // A previous run's --json report stands in for the videos: build the KMZ
+    // from what it recorded instead of rescanning.
+    let json_inputs = cli
+        .inputs
+        .iter()
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        })
+        .count();
+    if json_inputs > 0 {
+        if json_inputs != cli.inputs.len() {
+            bail!("cannot mix JSON reports and videos in one run");
+        }
+        let mut clips = Vec::new();
+        for input in &cli.inputs {
+            clips.extend(kml::from_json(input)?);
+        }
+        let wanted = match cli.kmz.as_deref().filter(|p| !kmz_is_auto(p)) {
+            Some(p) => p.to_path_buf(),
+            None => cli.inputs[0].with_extension("kmz"),
+        };
+        let out = if cli.force {
+            wanted
+        } else {
+            next_free_path(&wanted)
+        };
+        kml::write_kmz(&out, &clips)?;
+        report_kmz(&out, &clips, cli.quiet);
+        return Ok(());
+    }
+
     // Dashcams burn a timestamp, speed and their own vehicle tag into the
     // bottom strip. The tag is plate-shaped and would otherwise be "found" in
     // every single frame.
@@ -47,13 +80,206 @@ fn main() -> Result<()> {
     // a national format on top of it only discards valid readings.
     let strict = cli.strict_format || cli.engine == EngineKind::Tesseract;
     let rules = Rules::new(cli.region, &cli.patterns, strict)?;
+
+    let (inputs, had_dir) = expand_inputs(&cli.inputs)?;
+    // A directory holds arbitrarily many days of footage; one flat report
+    // over months would be useless, so directories imply trip grouping.
+    let by_trip = cli.by_trip || had_dir;
+    if had_dir && !cli.by_trip && !cli.quiet {
+        eprintln!("directory input: grouping into trips (as if --by-trip)");
+    }
+
+    let mut clips = probe_all(&inputs, &cli, had_dir)?;
+    // Rear cameras record no GPS of their own; the front camera rolled
+    // through the same seconds of driving, so borrow its track.
+    let donors: Vec<Clip> = clips.iter().filter(|c| c.gps.is_some()).cloned().collect();
+    for clip in &mut clips {
+        clip.borrow_gps(&donors);
+        if clip.gps_borrowed && !cli.quiet {
+            eprintln!("{}: no GPS of its own, using a paired clip's track", clip.stem);
+        }
+    }
+
+    if by_trip {
+        let trips = group_trips(clips, cli.trip_gap);
+        if !cli.quiet {
+            eprintln!("{} trip(s):", trips.len());
+            for trip in &trips {
+                let mins: f64 = trip.iter().map(|c| c.duration).sum::<f64>() / 60.0;
+                eprintln!(
+                    "  {} — {} clip(s), {mins:.0} min of video",
+                    trip_stem(trip),
+                    trip.len()
+                );
+            }
+        }
+        let dir = cli.out.clone().unwrap_or_default();
+        // Findings from any previous run in the output directory are reused
+        // rather than rescanned, so consolidating an already-scanned archive
+        // into trips costs only the clips that were never scanned.
+        let cache = ReportCache::build(&dir);
+        for trip in &trips {
+            let wanted = dir.join(format!("{}-plates.md", trip_stem(trip)));
+            let out_path = resolve_out_path(&wanted, &cli)?;
+            // The raw findings are always kept in trip mode, so a KMZ can be
+            // rebuilt from the report without a rescan.
+            let json_path = Some(out_path.with_extension("json"));
+            let kmz_path = cli.kmz.is_some().then(|| out_path.with_extension("kmz"));
+            run_batch(trip, &cli, &rules, &out_path, json_path, kmz_path, Some(&cache))?;
+        }
+        return Ok(());
+    }
+
     // A scan is expensive and its output is evidence; never destroy a previous
     // run's report by rerunning over it.
-    let wanted = report_path(&cli);
+    let out_path = resolve_out_path(&report_path(&cli), &cli)?;
+    let json_path = cli.json.as_ref().map(|p| {
+        if cli.force {
+            p.clone()
+        } else {
+            next_free_path(p)
+        }
+    });
+    let kmz_path = cli.kmz.as_ref().map(|p| {
+        let wanted = if kmz_is_auto(p) {
+            out_path.with_extension("kmz")
+        } else {
+            p.clone()
+        };
+        if cli.force {
+            wanted
+        } else {
+            next_free_path(&wanted)
+        }
+    });
+    run_batch(&clips, &cli, &rules, &out_path, json_path, kmz_path, None)
+}
+
+/// Findings from previous runs, indexed by clip stem so a clip that was
+/// already scanned is never scanned again.
+struct ReportCache {
+    by_stem: HashMap<String, (PathBuf, usize)>,
+}
+
+impl ReportCache {
+    /// Index every platescan JSON in a directory by the clip stems it holds.
+    fn build(dir: &Path) -> ReportCache {
+        let mut by_stem = HashMap::new();
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+                {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if doc["tool"].as_str() != Some("platescan") {
+                    continue;
+                }
+                for (i, c) in doc["clips"].as_array().into_iter().flatten().enumerate() {
+                    if let Some(stem) = c["stem"].as_str() {
+                        by_stem
+                            .entry(stem.to_string())
+                            .or_insert((path.clone(), i));
+                    }
+                }
+            }
+        }
+        ReportCache { by_stem }
+    }
+
+    fn get(&self, stem: &str) -> Option<report::ClipReport> {
+        let (path, index) = self.by_stem.get(stem)?;
+        report::read_json_clip(path, *index).ok()
+    }
+}
+
+/// Scan a set of clips into one consolidated report, with optional JSON and
+/// KMZ beside it. Clips covered by the cache reuse their previous findings
+/// instead of being scanned.
+fn run_batch(
+    clips: &[Clip],
+    cli: &Cli,
+    rules: &Rules,
+    out_path: &Path,
+    json_path: Option<PathBuf>,
+    kmz_path: Option<PathBuf>,
+    cache: Option<&ReportCache>,
+) -> Result<()> {
+    let crop_dir = (!cli.no_crops).then(|| crop_dir(cli, out_path));
+    if let Some(dir) = &crop_dir {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    let mut reports = Vec::new();
+    for clip in clips {
+        let cached = cache.and_then(|c| c.get(&clip.stem));
+        let mut report = match cached {
+            Some(cached) => {
+                if !cli.quiet {
+                    eprintln!("{}: reusing findings from a previous run", clip.stem);
+                }
+                cached
+            }
+            None => {
+                if !cli.quiet {
+                    eprintln!(
+                        "{}: {}x{} @ {:.2} fps, {:.1} s",
+                        clip.stem, clip.width, clip.height, clip.fps, clip.duration
+                    );
+                }
+                scan_clip(clip, cli, rules)?
+            }
+        };
+        if let Some(dir) = &crop_dir {
+            report.crops = save_crops(clip, &report.sightings, dir, out_path, cli)?;
+        }
+        reports.push(report);
+    }
+
+    report::write_markdown(out_path, &reports)?;
+    if let Some(json) = &json_path {
+        report::write_json(json, &reports)?;
+    }
+    let kmz_clips = match &kmz_path {
+        Some(kmz) => {
+            let kclips = kml::from_reports(&reports);
+            kml::write_kmz(kmz, &kclips)?;
+            Some(kclips)
+        }
+        None => None,
+    };
+
+    let total: usize = reports.iter().map(|r| r.sightings.len()).sum();
+    println!("{total} plate sighting(s) -> {}", out_path.display());
+    if let Some(json) = &json_path {
+        println!("raw findings -> {}", json.display());
+    }
+    if let (Some(kmz), Some(kclips)) = (&kmz_path, &kmz_clips) {
+        report_kmz(kmz, kclips, cli.quiet);
+    }
+    Ok(())
+}
+
+/// The requested report path, stepped aside from an existing file unless
+/// --force, with its directory created.
+fn resolve_out_path(wanted: &Path, cli: &Cli) -> Result<PathBuf> {
     let out_path = if cli.force {
-        wanted.clone()
+        wanted.to_path_buf()
     } else {
-        next_free_path(&wanted)
+        next_free_path(wanted)
     };
     if out_path != wanted && !cli.quiet {
         eprintln!(
@@ -68,48 +294,68 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to create {}", dir.display()))?;
         }
     }
-    let crop_dir = (!cli.no_crops).then(|| crop_dir(&cli, &out_path));
-    if let Some(dir) = &crop_dir {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-    }
-    let mut reports = Vec::new();
-    for input in &cli.inputs {
-        if !input.exists() {
-            bail!("no such file: {}", input.display());
-        }
-        let clip = Clip::probe(input)?;
-        if !cli.quiet {
-            eprintln!(
-                "{}: {}x{} @ {:.2} fps, {:.1} s",
-                clip.stem, clip.width, clip.height, clip.fps, clip.duration
-            );
-        }
-        let mut report = scan_clip(&clip, &cli, &rules)?;
-        if let Some(dir) = &crop_dir {
-            report.crops = save_crops(&clip, &report.sightings, dir, &out_path, &cli)?;
-        }
-        reports.push(report);
-    }
+    Ok(out_path)
+}
 
-    report::write_markdown(&out_path, &reports)?;
-    let json_path = cli.json.as_ref().map(|p| {
-        if cli.force {
-            p.clone()
-        } else {
-            next_free_path(p)
+/// Split clips into trips: runs whose recordings are contiguous. A gap
+/// longer than `gap` seconds with the camera off starts a new trip. Front
+/// and rear clips recorded together share start times, so they chain into
+/// the same trip.
+fn group_trips(mut clips: Vec<Clip>, gap: f64) -> Vec<Vec<Clip>> {
+    clips.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.stem.cmp(&b.stem)));
+    let mut trips: Vec<Vec<Clip>> = Vec::new();
+    let mut trip_end: Option<chrono::NaiveDateTime> = None;
+    for clip in clips {
+        let joins = match (trip_end, clip.start) {
+            (Some(end), Some(start)) => {
+                (start - end).num_milliseconds() as f64 / 1000.0 <= gap
+            }
+            // A clip with no decodable timestamp cannot chain to anything.
+            _ => false,
+        };
+        if !joins || trips.is_empty() {
+            trips.push(Vec::new());
+            trip_end = None;
         }
-    });
-    if let Some(json) = &json_path {
-        report::write_json(json, &reports)?;
+        let end = clip.start.map(|s| {
+            s + chrono::Duration::milliseconds((clip.duration * 1000.0) as i64)
+        });
+        // Paired clips end at the same moment; keep the trip's furthest end.
+        trip_end = match (trip_end, end) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => b.or(a),
+        };
+        trips.last_mut().expect("just pushed").push(clip);
     }
+    trips
+}
 
-    let total: usize = reports.iter().map(|r| r.sightings.len()).sum();
-    println!("{total} plate sighting(s) -> {}", out_path.display());
-    if let Some(json) = &json_path {
-        println!("raw findings -> {}", json.display());
+/// Name a trip after the wall-clock moment it started.
+fn trip_stem(trip: &[Clip]) -> String {
+    match trip.iter().filter_map(|c| c.start).min() {
+        Some(start) => format!("{}-trip", start.format("%Y_%m%d_%H%M%S")),
+        None => format!(
+            "{}-trip",
+            trip.first().map(|c| c.stem.as_str()).unwrap_or("unknown")
+        ),
     }
-    Ok(())
+}
+
+/// Summary line for a KMZ built from a JSON report, with a warning for any
+/// sightings that could not be placed.
+fn report_kmz(path: &Path, clips: &[kml::KmlClip], quiet: bool) {
+    let placed: usize = clips.iter().map(|c| c.placemarks.len()).sum();
+    let unplaced: usize = clips.iter().map(|c| c.unplaced).sum();
+    println!(
+        "{placed} placemark(s) from {} clip(s) -> {}",
+        clips.len(),
+        path.display()
+    );
+    if unplaced > 0 && !quiet {
+        eprintln!(
+            "warning: {unplaced} sighting(s) had no GPS fix and are not on the map"
+        );
+    }
 }
 
 fn scan_clip(clip: &Clip, cli: &Cli, rules: &Rules) -> Result<ClipReport> {
@@ -273,13 +519,7 @@ fn save_crops(
         let Some(bytes) = &s.still else {
             continue;
         };
-        let safe: String = s
-            .plate
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect();
-        let stamp = format!("{:08.3}", s.best_offset).replace('.', "_");
-        let file = dir.join(format!("{}-{:03}-{safe}-{stamp}.jpg", clip.stem, i + 1));
+        let file = dir.join(s.crop_name(&clip.stem, i));
         match std::fs::write(&file, bytes) {
             Ok(()) => {
                 out.insert(i, relative_to(&file, report_path));
@@ -289,6 +529,133 @@ fn save_crops(
         }
     }
     Ok(out)
+}
+
+/// Probe every input in parallel. A probe is I/O-bound — ffprobe plus a few
+/// hundred scattered GPS-record reads — so probing a large archive on
+/// spinning disks one clip at a time leaves the machine idle for minutes.
+/// Overlapping the seek latency across workers is close to a free speedup.
+///
+/// `lenient` (directory inputs) downgrades an unreadable clip to a warning:
+/// one corrupt file should not abort an archive-wide run. Explicitly named
+/// files still fail hard.
+fn probe_all(inputs: &[PathBuf], cli: &Cli, lenient: bool) -> Result<Vec<Clip>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if !cli.quiet && inputs.len() > 1 {
+        eprintln!("probing {} clip(s)", inputs.len());
+    }
+    let workers = cli.workers().clamp(1, 8).min(inputs.len().max(1));
+    let mut probed: Vec<Option<Clip>> = (0..inputs.len()).map(|_| None).collect();
+    let mut first_error = None;
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let next = &next;
+        let (tx, rx) = channel::<(usize, Result<Clip>)>();
+        for _ in 0..workers {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(input) = inputs.get(i) else { break };
+                    let result = if input.exists() {
+                        Clip::probe(input)
+                    } else {
+                        Err(anyhow::anyhow!("no such file: {}", input.display()))
+                    };
+                    if tx.send((i, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut done = 0usize;
+        for (i, result) in rx {
+            done += 1;
+            if !cli.quiet && inputs.len() > 10 && (done % 10 == 0 || done == inputs.len()) {
+                eprint!("\r  probed {done}/{}", inputs.len());
+                let _ = std::io::stderr().flush();
+            }
+            match result {
+                Ok(clip) => probed[i] = Some(clip),
+                Err(e) if lenient => {
+                    eprintln!("\nwarning: skipping {}: {e}", inputs[i].display());
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+        if !cli.quiet && inputs.len() > 10 {
+            eprintln!();
+        }
+    });
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+    Ok(probed.into_iter().flatten().collect())
+}
+
+/// A bare `--kmz` parses as the sentinel `auto`, meaning "derive the path
+/// from the report".
+fn kmz_is_auto(p: &Path) -> bool {
+    p.as_os_str().is_empty() || p == Path::new("auto")
+}
+
+/// Expand directory inputs to the MP4 files under them, recursively, in a
+/// stable order. Returns whether any input was a directory. Dashcams mirror
+/// locked clips into backup folders, so each stem is scanned once.
+fn expand_inputs(inputs: &[PathBuf]) -> Result<(Vec<PathBuf>, bool)> {
+    let mut out = Vec::new();
+    let mut had_dir = false;
+    for input in inputs {
+        if input.is_dir() {
+            had_dir = true;
+            let mut found = Vec::new();
+            collect_mp4s(input, &mut found)?;
+            if found.is_empty() {
+                bail!("no MP4 files under {}", input.display());
+            }
+            found.sort();
+            out.extend(found);
+        } else {
+            out.push(input.clone());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| {
+        p.file_stem()
+            .map(|s| seen.insert(s.to_os_string()))
+            .unwrap_or(true)
+    });
+    Ok((out, had_dir))
+}
+
+fn collect_mp4s(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let hidden = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'));
+        if hidden {
+            continue;
+        }
+        if path.is_dir() {
+            collect_mp4s(&path, out)?;
+        } else if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// The requested path, or the first `-2`, `-3`, ... variant that is free.

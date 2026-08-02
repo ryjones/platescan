@@ -13,6 +13,7 @@ leptonica-sys = "0.4.9"
 ort = { version = "2.0.0-rc.10", features = ["load-dynamic"] }
 regex = "1.13.1"
 serde_json = "1.0.151"
+zip = { version = "2", default-features = false }
 
 [profile.release]
 opt-level = 3

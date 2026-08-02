@@ -59,6 +59,18 @@ impl Sighting {
     pub fn duration(&self) -> f64 {
         self.last_seen - self.first_seen
     }
+
+    /// File name for this sighting's verification still, used both in the
+    /// crops directory and inside a KMZ.
+    pub fn crop_name(&self, stem: &str, index: usize) -> String {
+        let safe: String = self
+            .plate
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let stamp = format!("{:08.3}", self.best_offset).replace('.', "_");
+        format!("{stem}-{:03}-{safe}-{stamp}.jpg", index + 1)
+    }
 }
 
 /// How long a vehicle plausibly stays in view at a "typical" road speed. The

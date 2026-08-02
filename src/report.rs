@@ -3,10 +3,12 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use serde_json::json;
+use anyhow::{anyhow, Context, Result};
+use chrono::NaiveDateTime;
+use serde_json::{json, Value};
 
-use crate::clip::Clip;
+use crate::clip::{Camera, Clip};
+use crate::gps::{Fix, Track};
 use crate::track::Sighting;
 
 /// Scan parameters, echoed into the report so a result can be reproduced.
@@ -142,7 +144,12 @@ fn write_clip(md: &mut String, r: &ClipReport) -> Result<()> {
                 .unwrap_or_default();
             writeln!(
                 md,
-                "| Clock | GPS, {} fixes, UTC{}{skew} |",
+                "| Clock | GPS{}, {} fixes, UTC{}{skew} |",
+                if c.gps_borrowed {
+                    " (track borrowed from paired clip)"
+                } else {
+                    ""
+                },
                 track.fix_count(),
                 format_offset_minutes(minutes)
             )?;
@@ -306,6 +313,7 @@ pub fn write_json(path: &Path, reports: &[ClipReport]) -> Result<()> {
                 "clock_source": if r.clip.clock_is_gps() { "gps" } else { "filename" },
                 "utc_offset_minutes": r.clip.utc_offset_minutes,
                 "gps_fixes": r.clip.gps.as_ref().map(|g| g.fix_count()),
+                "gps_borrowed": r.clip.gps_borrowed,
                 "width": r.clip.width,
                 "height": r.clip.height,
                 "fps": r.clip.fps,
@@ -366,6 +374,154 @@ pub fn write_json(path: &Path, reports: &[ClipReport]) -> Result<()> {
     Ok(())
 }
 
+/// Rebuild one clip's report from a `--json` file written by a previous
+/// run, so its findings can be consolidated or exported without rescanning.
+/// Crop stills are reloaded from beside the report; the GPS track is
+/// re-read from the source clip when it is still reachable, and otherwise
+/// reassembled from the per-sighting fixes the report recorded.
+pub fn read_json_clip(path: &Path, index: usize) -> Result<ClipReport> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let doc: Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    let c = doc["clips"]
+        .get(index)
+        .ok_or_else(|| anyhow!("{}: no clip at index {index}", path.display()))?;
+    clip_report_from_value(c, path.parent().unwrap_or(Path::new("")))
+}
+
+fn clip_report_from_value(c: &Value, base: &Path) -> Result<ClipReport> {
+    let file = PathBuf::from(c["file"].as_str().unwrap_or_default());
+    let stem = c["stem"].as_str().unwrap_or("clip").to_string();
+    let start = c["clip_start"]
+        .as_str()
+        .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok());
+    let duration = c["duration_s"].as_f64().unwrap_or(0.0);
+    let sightings_json = c["sightings"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+
+    let gps = if file.exists() {
+        crate::clip::disk_track(&file, start, duration)
+    } else {
+        None
+    }
+    .or_else(|| Track::from_sparse(sparse_fixes(sightings_json), duration));
+
+    let clip = Clip {
+        path: file,
+        stem,
+        start,
+        camera: match c["camera"].as_str() {
+            Some("front") => Some(Camera::Front),
+            Some("rear") => Some(Camera::Rear),
+            _ => None,
+        },
+        sequence: c["sequence"].as_u64().map(|v| v as u32),
+        width: c["width"].as_u64().unwrap_or(0) as u32,
+        height: c["height"].as_u64().unwrap_or(0) as u32,
+        fps: c["fps"].as_f64().unwrap_or(0.0),
+        duration,
+        gps,
+        gps_borrowed: c["gps_borrowed"].as_bool().unwrap_or(false),
+        utc_offset_minutes: c["utc_offset_minutes"].as_i64().map(|v| v as i32),
+    };
+
+    let sightings = sightings_json
+        .iter()
+        .map(|s| {
+            let rect = s["best_rect"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let at = |i: usize| rect.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
+            Sighting {
+                plate: s["plate"].as_str().unwrap_or("?").to_string(),
+                first_seen: s["first_seen_s"].as_f64().unwrap_or(0.0),
+                last_seen: s["last_seen_s"].as_f64().unwrap_or(0.0),
+                frames: s["frames"].as_u64().unwrap_or(0) as usize,
+                best_conf: s["best_conf"].as_f64().unwrap_or(0.0) as f32,
+                mean_conf: s["mean_conf"].as_f64().unwrap_or(0.0) as f32,
+                best_offset: s["best_offset_s"].as_f64().unwrap_or(0.0),
+                best_rect: (at(0), at(1), at(2), at(3)),
+                detector_score: s["detector_score"].as_f64().map(|v| v as f32),
+                region: s["region"].as_str().map(str::to_string),
+                still: s["crop"].as_str().and_then(|rel| {
+                    let p = PathBuf::from(rel);
+                    let full = if p.is_absolute() { p } else { base.join(p) };
+                    std::fs::read(full).ok()
+                }),
+                variants: s["variants"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|v| {
+                        Some((v["text"].as_str()?.to_string(), v["count"].as_u64()? as usize))
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+
+    let p = &c["params"];
+    Ok(ClipReport {
+        clip,
+        params: ScanParams {
+            fps: p["sample_fps"].as_f64().unwrap_or(0.0),
+            start: p["start_s"].as_f64().unwrap_or(0.0),
+            end: p["end_s"].as_f64(),
+            roi: {
+                let roi = p["roi"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let at = |i: usize| roi.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
+                (at(0), at(1), at(2), at(3))
+            },
+            detail: p["detail"].as_str().unwrap_or("").to_string(),
+            min_conf: p["min_conf"].as_f64().unwrap_or(0.0) as f32,
+            min_height: p["min_height_px"].as_f64().unwrap_or(0.0) as f32,
+            min_hits: p["min_hits"].as_u64().unwrap_or(0) as usize,
+            gap: p["gap_s"].as_f64().unwrap_or(0.0),
+            region: p["region"].as_str().unwrap_or("generic").to_string(),
+            patterns: p["patterns"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            engine: p["engine"].as_str().unwrap_or("alpr").to_string(),
+        },
+        sightings,
+        crops: HashMap::new(),
+        frames_scanned: c["frames_scanned"].as_u64().unwrap_or(0),
+        raw_detections: c["raw_detections"].as_u64().unwrap_or(0) as usize,
+        elapsed: Duration::from_secs_f64(c["elapsed_s"].as_f64().unwrap_or(0.0)),
+    })
+}
+
+/// Per-sighting fixes recorded in a report, for rebuilding a track when the
+/// source clip is gone. A fix needs both a position and a GPS time;
+/// sightings missing either contribute nothing.
+fn sparse_fixes(sightings: &[Value]) -> Vec<(f64, Fix)> {
+    sightings
+        .iter()
+        .filter_map(|s| {
+            let offset = s["best_offset_s"].as_f64().unwrap_or(0.0);
+            let lat = s["gps"]["lat"].as_f64()?;
+            let lon = s["gps"]["lon"].as_f64()?;
+            let time = s["gps_utc"].as_str().and_then(|t| {
+                NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S%.fZ").ok()
+            })?;
+            Some((
+                offset,
+                Fix {
+                    time,
+                    lat,
+                    lon,
+                    speed_knots: s["gps"]["speed_mph"].as_f64().unwrap_or(0.0) as f32
+                        / 1.150_779,
+                    bearing: s["gps"]["bearing_deg"].as_f64().unwrap_or(0.0) as f32,
+                },
+            ))
+        })
+        .collect()
+}
+
 /// A UTC offset in minutes as `-07:00`.
 fn format_offset_minutes(minutes: i32) -> String {
     let sign = if minutes < 0 { '-' } else { '+' };
@@ -385,7 +541,7 @@ fn wall_clock(clip: &Clip, offset_s: f64) -> String {
 }
 
 /// `MM:SS.mmm`, widening to `H:MM:SS.mmm` past an hour.
-fn offset(seconds: f64) -> String {
+pub fn offset(seconds: f64) -> String {
     let total_ms = (seconds.max(0.0) * 1000.0).round() as u64;
     let (ms, s) = (total_ms % 1000, total_ms / 1000);
     let (h, m, s) = (s / 3600, (s % 3600) / 60, s % 60);

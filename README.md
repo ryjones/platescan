@@ -82,7 +82,56 @@ Each sighting then also carries where it happened:
 
 A receiver that starts without a lock leaves the opening minutes without fixes;
 those stretches fall back to the file-name clock, and the report says which
-clock it used. Rear-camera clips generally carry no GPS at all.
+clock it used. Rear-camera clips carry no GPS of their own, so `platescan`
+borrows the track from the paired front clip — one scanned in the same run, or
+failing that one found beside the file with an overlapping time stamp — shifted
+into the rear clip's timeline. The report marks the track as borrowed.
+
+## Google Earth
+
+`--kmz` writes a KMZ alongside the report: one placemark per sighting at the
+GPS fix of its best reading, with the verification crop embedded in the
+balloon, a timestamp for Earth's time slider, and each clip's drive traced as
+a line.
+
+```
+platescan clip.MP4 --kmz clip.kmz
+```
+
+A KMZ can also be built from a previous run without rescanning, by passing
+that run's `--json` report as the input; crops are picked up from beside the
+report:
+
+```
+platescan reports/clip-plates.json --kmz clip.kmz     # --kmz optional here
+```
+
+Sightings with no fix (no GPS and no borrowable pair) are left off the map,
+with a warning saying how many.
+
+## Trips
+
+`--by-trip` turns a pile of clips into one consolidated report per drive:
+
+```
+platescan /footage/2026_0727*.MP4 --by-trip --out reports --kmz
+```
+
+A directory input is scanned recursively for MP4s and implies `--by-trip`,
+so months of footage can be handed over as-is; duplicate stems (locked-clip
+backup folders) are scanned once. Clips are sorted by wall-clock start and
+split wherever the camera was off longer than `--trip-gap` (90 s by
+default); front and rear clips recorded together always land in the same
+trip. Each trip gets
+`<start>-trip-plates.md`, a JSON of raw findings (always written in this
+mode, so a KMZ can be rebuilt later without rescanning), crops, and — with
+`--kmz` — a Google Earth file, all named after the trip's start time. In
+this mode `--out` names a directory.
+
+Clips already covered by any platescan JSON in the output directory are not
+rescanned: their findings are folded straight into the trip report, crops
+and all. Consolidating a directory of per-clip reports into trip reports
+therefore only pays for clips that were never scanned.
 
 ## Requirements
 
@@ -189,6 +238,9 @@ every frame. The default region of interest excludes the bottom of the frame;
 | `--psm` | `11` | Page segmentation mode (tesseract) |
 | `-j`, `--jobs` | cores - 1 | Parallel workers |
 | `--json` | - | Also write raw findings as JSON |
+| `--kmz` | - | Also write a Google Earth KMZ with embedded crops; takes a `--json` report as input to skip rescanning |
+| `--by-trip` | off | One consolidated report per contiguous run of clips; `--out` becomes a directory |
+| `--trip-gap` | `90` | Seconds of camera-off that still counts as the same trip |
 | `--no-crops` | off | Skip saving verification stills |
 | `--force` | off | Overwrite an existing report instead of writing beside it |
 
