@@ -227,9 +227,19 @@ fn run_batch(
     for clip in clips {
         let cached = cache.and_then(|c| c.get(&clip.stem));
         let mut report = match cached {
-            Some(cached) => {
+            Some(mut cached) => {
                 if !cli.quiet {
                     eprintln!("{}: reusing findings from a previous run", clip.stem);
+                }
+                // The JSON may predate a move of the footage, leaving its
+                // recorded file path dead and its track rebuilt sparsely
+                // from per-sighting fixes. The clip we just probed is
+                // authoritative for both.
+                cached.clip.path = clip.path.clone();
+                if clip.gps.is_some() {
+                    cached.clip.gps = clip.gps.clone();
+                    cached.clip.gps_borrowed = clip.gps_borrowed;
+                    cached.clip.utc_offset_minutes = clip.utc_offset_minutes;
                 }
                 cached
             }
