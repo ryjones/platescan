@@ -51,8 +51,16 @@ impl Clip {
             .to_string();
         let name = parse_name(&stem);
         let start = name.as_ref().and_then(|n| n.start);
-        // A missing or unreadable GPS box is normal, not an error.
-        let gps = crate::gps::Track::read(path).unwrap_or(None);
+        let camera = name.as_ref().and_then(|n| n.camera);
+        // A missing or unreadable GPS box is normal, not an error. Rear
+        // clips never carry a usable track, so don't pay the few hundred
+        // scattered reads to discover that every time — their sightings are
+        // placed via a borrowed front track instead.
+        let gps = if camera == Some(Camera::Rear) {
+            None
+        } else {
+            crate::gps::Track::read(path).unwrap_or(None)
+        };
         let utc_offset_minutes = gps
             .as_ref()
             .zip(start)
@@ -61,7 +69,7 @@ impl Clip {
             path: path.to_path_buf(),
             stem,
             start,
-            camera: name.as_ref().and_then(|n| n.camera),
+            camera,
             sequence: name.as_ref().and_then(|n| n.sequence),
             width: meta.width,
             height: meta.height,

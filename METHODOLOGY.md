@@ -96,6 +96,9 @@ cameras, but the provenance should be visible in evidence.
 scattered 96-byte reads through `mdat`, which is seek-latency, not bandwidth.
 Probing clips one at a time left the machine near-idle for minutes on a
 280-clip archive, so probes run on a small worker pool to overlap the seeks.
+Rear (`R`) clips skip the track read entirely — they never carry a usable
+one, and paying hundreds of seeks per clip to rediscover that doubled the
+cost of enumerating an archive; their tracks are borrowed (§1) instead.
 For directory inputs an unreadable clip is skipped with a warning rather than
 aborting the run — one corrupt file should not cost an archive scan.
 
