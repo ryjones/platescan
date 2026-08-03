@@ -134,6 +134,18 @@ fn main() -> Result<()> {
         let cache = ReportCache::build(&dir);
         for trip in &trips {
             let wanted = dir.join(format!("{}-plates.md", trip_stem(trip)));
+            // A trip whose report already exists is done; stepping aside to
+            // a -2 variant would duplicate the whole archive on every
+            // resume. --force rebuilds (e.g. after a trip gains clips).
+            if !cli.force && wanted.exists() {
+                if !cli.quiet {
+                    eprintln!(
+                        "{}: report exists, skipping (--force to rebuild)",
+                        trip_stem(trip)
+                    );
+                }
+                continue;
+            }
             let out_path = resolve_out_path(&wanted, &cli)?;
             // The raw findings are always kept in trip mode, so a KMZ can be
             // rebuilt from the report without a rescan.

@@ -148,7 +148,9 @@ this mode `--out` names a directory.
 Clips already covered by any platescan JSON in the output directory are not
 rescanned: their findings are folded straight into the trip report, crops
 and all. Consolidating a directory of per-clip reports into trip reports
-therefore only pays for clips that were never scanned.
+therefore only pays for clips that were never scanned. A trip whose report
+already exists is skipped outright, so rerunning over a grown archive
+resumes where the last run stopped; `--force` rebuilds existing trips.
 
 ## Requirements
 
