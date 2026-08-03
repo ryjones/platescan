@@ -50,6 +50,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 90.0)]
     pub trip_gap: f64,
 
+    /// Probe the inputs, group them into trips, and print one line per trip
+    /// to stdout — the trip stem, then its clip paths, tab-separated — then
+    /// exit without scanning anything. Made for driving an external work
+    /// queue: enumerate cheaply here, scan each trip in a separate run.
+    #[arg(long)]
+    pub list_trips: bool,
+
     /// Recognition backend
     #[arg(long, value_enum, default_value_t = EngineKind::Alpr)]
     pub engine: EngineKind,

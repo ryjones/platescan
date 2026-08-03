@@ -103,7 +103,7 @@ fn main() -> Result<()> {
         eprintln!("directory input: grouping into trips (as if --by-trip)");
     }
 
-    let mut clips = probe_all(&inputs, &cli, had_dir)?;
+    let mut clips = probe_all(&inputs, &cli, had_dir || cli.list_trips)?;
     // Rear cameras record no GPS of their own; the front camera rolled
     // through the same seconds of driving, so borrow its track.
     let donors: Vec<Clip> = clips.iter().filter(|c| c.gps.is_some()).cloned().collect();
@@ -112,6 +112,20 @@ fn main() -> Result<()> {
         if clip.gps_borrowed && !cli.quiet {
             eprintln!("{}: no GPS of its own, using a paired clip's track", clip.stem);
         }
+    }
+
+    if cli.list_trips {
+        let trips = group_trips(clips, cli.trip_gap);
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for trip in &trips {
+            write!(out, "{}", trip_stem(trip))?;
+            for clip in trip {
+                write!(out, "\t{}", clip.path.display())?;
+            }
+            writeln!(out)?;
+        }
+        return Ok(());
     }
 
     if by_trip {

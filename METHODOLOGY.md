@@ -272,6 +272,13 @@ becomes a trip of its own. Each trip is scanned as one consolidated report —
 Markdown, raw JSON (always, see §10), crops, and optionally KMZ — named after
 the trip's start time.
 
+`--list-trips` stops after grouping: it prints each trip's stem and clip
+paths, tab-separated, one trip per line, and scans nothing. This decouples
+enumeration from scanning so an external queue can hand trips to independent
+platescan runs — probe a day, queue its trips, scan them one at a time while
+later days are still being probed. The alprs repo's `scan-dc.zsh` (producer)
+and `process-dc.zsh` (consumer) are that queue.
+
 ## 10. Reuse
 
 In trip mode, every platescan JSON already in the output directory is indexed

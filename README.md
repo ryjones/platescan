@@ -152,6 +152,11 @@ therefore only pays for clips that were never scanned. A trip whose report
 already exists is skipped outright, so rerunning over a grown archive
 resumes where the last run stopped; `--force` rebuilds existing trips.
 
+`--list-trips` probes and groups the inputs, prints one line per trip to
+stdout — the trip stem, then its clip paths, tab-separated — and exits
+without scanning. It exists to drive an external work queue: enumerate an
+archive cheaply, then scan each trip in its own platescan run.
+
 ## Requirements
 
 ```
@@ -261,6 +266,7 @@ every frame. The default region of interest excludes the bottom of the frame;
 | `--html` | - | Also write a self-contained browser map with embedded crops; same inputs as `--kmz` |
 | `--by-trip` | off | One consolidated report per contiguous run of clips; `--out` becomes a directory |
 | `--trip-gap` | `90` | Seconds of camera-off that still counts as the same trip |
+| `--list-trips` | off | Print trip stems and clip paths (tab-separated) instead of scanning; for external work queues |
 | `--no-crops` | off | Skip saving verification stills |
 | `--force` | off | Overwrite an existing report instead of writing beside it |
 

@@ -201,13 +201,15 @@ struct NameParts {
     sequence: Option<u32>,
 }
 
-/// Decode dashcam file names such as `2026_0801_131218_000289F`.
+/// Decode dashcam file names such as `2026_0801_131218_000289F` or
+/// `2025_0804_144044_F` (no sequence number).
 fn parse_name(stem: &str) -> Option<NameParts> {
     let re = Regex::new(
         r"(?x)
         (?P<y>\d{4}) [_-]? (?P<mo>\d{2}) (?P<d>\d{2}) [_-]?
         (?P<h>\d{2}) (?P<mi>\d{2}) (?P<s>\d{2})
         (?: [_-] (?P<seq>\d+) )?
+        [_-]?
         (?P<cam>[FRfr])?
         \s*$",
     )
@@ -319,6 +321,17 @@ mod tests {
         let p = parse_name("2026_0717_112820_000002R").expect("should parse");
         assert_eq!(p.camera, Some(Camera::Rear));
         assert_eq!(p.sequence, Some(2));
+    }
+
+    #[test]
+    fn parses_name_without_sequence() {
+        let p = parse_name("2025_0804_144044_F").expect("should parse");
+        assert_eq!(
+            p.start.map(|t| t.to_string()),
+            Some("2025-08-04 14:40:44".to_string())
+        );
+        assert_eq!(p.camera, Some(Camera::Front));
+        assert_eq!(p.sequence, None);
     }
 
     #[test]
