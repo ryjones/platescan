@@ -435,6 +435,7 @@ fn scan_clip(clip: &Clip, cli: &Cli, rules: &Rules) -> Result<ClipReport> {
                 overlap: cli.overlap,
                 min_height: cli.min_height,
                 min_conf: cli.min_conf,
+                coreml: cli.coreml,
             })?) as Box<dyn Scanner>,
             EngineKind::Tesseract => Box::new(Engine::new(
                 cli.tessdata.as_deref(),

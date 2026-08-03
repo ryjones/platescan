@@ -279,6 +279,12 @@ Runtime scales with sampled frames x detector windows. Widening `--roi`
 vertically past one window height doubles the work, so keep it to the band where
 plates actually appear.
 
+On macOS, video decode goes through VideoToolbox (the media engine)
+automatically, worth roughly 8% end to end. `--coreml` additionally puts the
+detector on the Apple GPU / Neural Engine, but it is **experimental**: the
+recognizer's graph does not convert, and CoreML model compilation hangs
+intermittently in ANECompilerService, so do not use it for unattended runs.
+
 ## Layout
 
 `METHODOLOGY.md` documents the pipeline itself — the formats, transforms and

@@ -67,6 +67,14 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.35)]
     pub det_conf: f32,
 
+    /// EXPERIMENTAL: run the plate detector through CoreML (Apple GPU /
+    /// Neural Engine). The recognizer stays on CPU (its graph does not
+    /// convert), and model compilation is known to hang intermittently in
+    /// ANECompilerService — do not use for unattended runs. macOS only;
+    /// needs a libonnxruntime built with the CoreML execution provider.
+    #[arg(long)]
+    pub coreml: bool,
+
     /// Require readings to match the --region plate format. Off by default for
     /// the alpr engine, whose detector already establishes that it is a plate.
     #[arg(long)]

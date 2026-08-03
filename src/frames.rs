@@ -167,6 +167,10 @@ impl FrameStream {
         let (x, y, w, h) = spec.roi;
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-hide_banner", "-nostdin", "-v", "error"]);
+        // Hardware decode via the media engine; ffmpeg falls back to
+        // software on its own for codecs VideoToolbox does not take.
+        #[cfg(target_os = "macos")]
+        cmd.args(["-hwaccel", "videotoolbox"]);
         cmd.args(["-ss", &format!("{:.3}", spec.start)]);
         cmd.arg("-i").arg(path);
         if let Some(end) = spec.end {

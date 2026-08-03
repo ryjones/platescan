@@ -27,6 +27,9 @@ pub struct AlprSettings {
     /// Discard boxes shorter than this in source pixels.
     pub min_height: f32,
     pub min_conf: f32,
+    /// Run the models through CoreML (Apple GPU / Neural Engine), falling
+    /// back to CPU per-operator for anything CoreML cannot take.
+    pub coreml: bool,
 }
 
 /// Alphabet and geometry the recognizer was trained with.
@@ -153,12 +156,30 @@ impl Alpr {
         let models = resolve_models(&settings.models)?;
         let det_path = pick(&models, &["license-plate", "license_plate"], "detector")?;
         let rec_path = pick(&models, &["cct", "ocr", "vit"], "recognizer")?;
-        let det = Session::builder()?
-            .commit_from_file(&det_path)
-            .with_context(|| format!("failed to load detector {}", det_path.display()))?;
-        let rec = Session::builder()?
-            .commit_from_file(&rec_path)
-            .with_context(|| format!("failed to load recognizer {}", rec_path.display()))?;
+        let build = |path: &PathBuf, label: &str, coreml: bool| -> Result<Session> {
+            let mut builder = Session::builder()?;
+            if coreml {
+                // MLProgram is the modern CoreML format; the default
+                // NeuralNetwork path hangs in ANECompilerService on these
+                // models. The builder error variant carries the (non-Send)
+                // builder itself, so it cannot cross `?` into anyhow
+                // unmapped.
+                let ep = ort::ep::CoreML::default()
+                    .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
+                    .build();
+                builder = builder
+                    .with_execution_providers([ep])
+                    .map_err(|e| anyhow::anyhow!("failed to enable CoreML: {e}"))?;
+            }
+            builder
+                .commit_from_file(path)
+                .with_context(|| format!("failed to load {label} {}", path.display()))
+        };
+        // CoreML takes the detector only: it is where nearly all the compute
+        // goes, and the recognizer's graph trips a CoreML converter bug
+        // ("required param 'pad' is missing" in its patch extractor).
+        let det = build(&det_path, "detector", settings.coreml)?;
+        let rec = build(&rec_path, "recognizer", false)?;
         let window = input_edge(&det).unwrap_or(640);
         Ok(Alpr {
             det,
@@ -327,11 +348,12 @@ impl Scanner for Alpr {
         };
         format!(
             "onnx alpr: {} + {}; {win}x{win} windows at native resolution, \
-             {:.0}% overlap, detector score >= {:.2}",
+             {:.0}% overlap, detector score >= {:.2}{}",
             name(&self.det_path),
             name(&self.rec_path),
             self.settings.overlap * 100.0,
             self.settings.det_conf,
+            if self.settings.coreml { ", coreml" } else { "" },
             win = self.window,
         )
     }
