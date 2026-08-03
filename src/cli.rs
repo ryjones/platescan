@@ -69,9 +69,10 @@ pub struct Cli {
 
     /// EXPERIMENTAL: run the plate detector through CoreML (Apple GPU /
     /// Neural Engine). The recognizer stays on CPU (its graph does not
-    /// convert), and model compilation is known to hang intermittently in
-    /// ANECompilerService — do not use for unattended runs. macOS only;
-    /// needs a libonnxruntime built with the CoreML execution provider.
+    /// convert), and session initialisation is known to hang in
+    /// ANECompilerService — observed even with a single shared session —
+    /// so do not use for unattended runs. macOS only; needs a
+    /// libonnxruntime built with the CoreML execution provider.
     #[arg(long)]
     pub coreml: bool,
 

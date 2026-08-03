@@ -3,6 +3,7 @@
 //! the recognizer only ever sees an isolated, normalised plate.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use image::{imageops::FilterType, RgbImage};
@@ -128,7 +129,7 @@ fn parse_regions(text: &str) -> Vec<String> {
 }
 
 pub struct Alpr {
-    det: Session,
+    det: Arc<Mutex<Session>>,
     rec: Session,
     cfg: PlateConfig,
     settings: AlprSettings,
@@ -136,6 +137,18 @@ pub struct Alpr {
     window: u32,
     det_path: PathBuf,
     rec_path: PathBuf,
+}
+
+/// A detector session shared between workers. CoreML compiles a model once
+/// per session and queues inference through the Neural Engine, so
+/// per-worker copies would compile the same model over and over
+/// concurrently — racing ANECompilerService is what hangs. CPU sessions
+/// are never shared: they scale with worker parallelism.
+#[derive(Clone)]
+pub struct SharedDetector {
+    session: Arc<Mutex<Session>>,
+    path: PathBuf,
+    window: u32,
 }
 
 /// The square input edge a detector expects, from its `[1, 3, H, W]` input.
@@ -151,7 +164,10 @@ fn input_edge(session: &Session) -> Option<u32> {
 }
 
 impl Alpr {
-    pub fn new(settings: &AlprSettings) -> Result<Alpr> {
+    /// Build a worker's engine. With CoreML, the first worker's detector
+    /// session is stored in `shared` and every later worker reuses it; see
+    /// [`SharedDetector`].
+    pub fn new(settings: &AlprSettings, shared: &mut Option<SharedDetector>) -> Result<Alpr> {
         init_runtime(settings.dylib.as_deref())?;
         let models = resolve_models(&settings.models)?;
         let det_path = pick(&models, &["license-plate", "license_plate"], "detector")?;
@@ -178,9 +194,23 @@ impl Alpr {
         // CoreML takes the detector only: it is where nearly all the compute
         // goes, and the recognizer's graph trips a CoreML converter bug
         // ("required param 'pad' is missing" in its patch extractor).
-        let det = build(&det_path, "detector", settings.coreml)?;
         let rec = build(&rec_path, "recognizer", false)?;
-        let window = input_edge(&det).unwrap_or(640);
+        let (det, det_path, window) = match shared.as_ref() {
+            Some(s) => (Arc::clone(&s.session), s.path.clone(), s.window),
+            None => {
+                let session = build(&det_path, "detector", settings.coreml)?;
+                let window = input_edge(&session).unwrap_or(640);
+                let det = Arc::new(Mutex::new(session));
+                if settings.coreml {
+                    *shared = Some(SharedDetector {
+                        session: Arc::clone(&det),
+                        path: det_path.clone(),
+                        window,
+                    });
+                }
+                (det, det_path, window)
+            }
+        };
         Ok(Alpr {
             det,
             rec,
@@ -225,9 +255,15 @@ impl Alpr {
             chw[2 * plane + i] = p.0[2] as f32 / 255.0;
         }
         let input = Tensor::from_array((vec![1i64, 3, size as i64, size as i64], chw))?;
-        let name = self.det.inputs()[0].name().to_string();
-        let outputs = self.det.run(ort::inputs![name => input])?;
-        let (_, data) = outputs[0].try_extract_tensor::<f32>()?;
+        // The session may be shared between workers (CoreML), so inference
+        // holds its lock; the output is copied out before releasing.
+        let data: Vec<f32> = {
+            let mut det = self.det.lock().expect("detector session poisoned");
+            let name = det.inputs()[0].name().to_string();
+            let outputs = det.run(ort::inputs![name => input])?;
+            let (_, data) = outputs[0].try_extract_tensor::<f32>()?;
+            data.to_vec()
+        };
 
         let mut out = Vec::new();
         for row in data.chunks(DET_COLS) {

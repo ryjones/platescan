@@ -438,17 +438,23 @@ fn scan_clip(clip: &Clip, cli: &Cli, rules: &Rules) -> Result<ClipReport> {
     // tessdata file fails immediately rather than part-way through a clip.
     let workers = cli.workers();
     let mut engines: Vec<Box<dyn Scanner>> = Vec::with_capacity(workers);
+    // With CoreML the detector session is built once and shared; every
+    // worker compiling its own copy races ANECompilerService and hangs.
+    let mut shared_det: Option<alpr::SharedDetector> = None;
     for _ in 0..workers {
         engines.push(match cli.engine {
-            EngineKind::Alpr => Box::new(Alpr::new(&AlprSettings {
-                models: cli.models.clone(),
-                dylib: cli.ort_dylib.clone(),
-                det_conf: cli.det_conf,
-                overlap: cli.overlap,
-                min_height: cli.min_height,
-                min_conf: cli.min_conf,
-                coreml: cli.coreml,
-            })?) as Box<dyn Scanner>,
+            EngineKind::Alpr => Box::new(Alpr::new(
+                &AlprSettings {
+                    models: cli.models.clone(),
+                    dylib: cli.ort_dylib.clone(),
+                    det_conf: cli.det_conf,
+                    overlap: cli.overlap,
+                    min_height: cli.min_height,
+                    min_conf: cli.min_conf,
+                    coreml: cli.coreml,
+                },
+                &mut shared_det,
+            )?) as Box<dyn Scanner>,
             EngineKind::Tesseract => Box::new(Engine::new(
                 cli.tessdata.as_deref(),
                 &cli.lang,

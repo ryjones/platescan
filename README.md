@@ -283,9 +283,11 @@ plates actually appear.
 
 On macOS, video decode goes through VideoToolbox (the media engine)
 automatically, worth roughly 8% end to end. `--coreml` additionally puts the
-detector on the Apple GPU / Neural Engine, but it is **experimental**: the
-recognizer's graph does not convert, and CoreML model compilation hangs
-intermittently in ANECompilerService, so do not use it for unattended runs.
+detector on the Apple GPU / Neural Engine — one session, compiled once and
+shared by all workers — but it is **experimental**: the recognizer's graph
+does not convert, and session initialisation hangs in ANECompilerService
+(observed even with the single shared session), so do not use it for
+unattended runs.
 
 ## Layout
 
