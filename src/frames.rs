@@ -1,9 +1,16 @@
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use anyhow::{bail, Context, Result};
 use image::ExtendedColorType;
+
+/// How much of ffmpeg's complaining to keep for the error message. A clip
+/// whose video rots emits one line per corrupt packet, which can run to
+/// megabytes; the last few kilobytes say everything useful.
+const STDERR_KEEP: usize = 8 << 10;
 
 /// Pixel layout requested from ffmpeg. Grayscale is enough for OCR and moves a
 /// third of the bytes; the ONNX models need colour.
@@ -152,6 +159,13 @@ pub struct SampleSpec {
 pub struct FrameStream {
     child: Child,
     stdout: BufReader<ChildStdout>,
+    /// ffmpeg's stderr, drained by a thread for as long as it runs. Reading it
+    /// only at the end would deadlock: a pipe holds 64KB, and a clip with a
+    /// corrupt tail writes past that, at which point ffmpeg blocks on the write
+    /// and stops producing frames while we wait for a frame that never comes.
+    /// Both processes then sit at no CPU indefinitely.
+    stderr: Arc<Mutex<String>>,
+    drain: Option<JoinHandle<()>>,
     spec_start: f64,
     fps: f64,
     origin: (u32, u32),
@@ -160,6 +174,30 @@ pub struct FrameStream {
     format: PixelFormat,
     index: u64,
     done: bool,
+}
+
+/// Read a child's stderr to exhaustion on a thread, keeping the tail.
+fn drain_stderr(mut stderr: impl Read + Send + 'static, into: Arc<Mutex<String>>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8 << 10];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut held = into.lock().unwrap_or_else(|e| e.into_inner());
+                    held.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if held.len() > STDERR_KEEP {
+                        // keep the tail, on a character boundary
+                        let cut = held.len() - STDERR_KEEP;
+                        let cut = (cut..held.len())
+                            .find(|i| held.is_char_boundary(*i))
+                            .unwrap_or(held.len());
+                        *held = held[cut..].to_string();
+                    }
+                }
+            }
+        }
+    })
 }
 
 impl FrameStream {
@@ -190,9 +228,17 @@ impl FrameStream {
 
         let mut child = cmd.spawn().context("failed to run ffmpeg")?;
         let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = Arc::new(Mutex::new(String::new()));
+        // Start draining immediately; ffmpeg must never block writing errors.
+        let drain = child
+            .stderr
+            .take()
+            .map(|e| drain_stderr(e, Arc::clone(&stderr)));
         Ok(FrameStream {
             child,
             stdout: BufReader::with_capacity(1 << 20, stdout),
+            stderr,
+            drain,
             spec_start: spec.start,
             fps: spec.fps,
             origin: (x, y),
@@ -240,12 +286,18 @@ impl FrameStream {
 
     fn finish(&mut self) -> Result<()> {
         let status = self.child.wait()?;
+        // The drain ends when the pipe closes, which wait() has just ensured.
+        if let Some(h) = self.drain.take() {
+            let _ = h.join();
+        }
         if !status.success() {
-            let mut err = String::new();
-            if let Some(mut stderr) = self.child.stderr.take() {
-                let _ = stderr.read_to_string(&mut err);
-            }
-            bail!("ffmpeg exited with {status}: {}", err.trim());
+            let err = self
+                .stderr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .trim()
+                .to_string();
+            bail!("ffmpeg exited with {status}: {err}");
         }
         Ok(())
     }
@@ -256,6 +308,10 @@ impl Drop for FrameStream {
         if !self.done {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+        // Killing the child closes the pipe, so the drain returns on its own.
+        if let Some(h) = self.drain.take() {
+            let _ = h.join();
         }
     }
 }
@@ -316,5 +372,46 @@ mod tests {
         let crop = f.crop_rgb(10, 10, 4, 2);
         assert_eq!(crop.as_raw().len(), 4 * 2 * 3);
         assert!(crop.as_raw().iter().all(|&v| v == 200));
+    }
+
+    /// A clip whose video rots writes one complaint per corrupt packet, easily
+    /// more than the 64KB a pipe holds. Reading stderr only at the end would
+    /// wedge ffmpeg mid-write and stall the frame stream forever, so the drain
+    /// has to keep up while the process runs.
+    #[test]
+    fn a_flood_of_stderr_does_not_block_the_writer() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        const FLOOD: usize = 512 << 10; // 8x a pipe buffer
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "i=0; while [ $i -lt {} ]; do                    printf '[h264] Invalid NAL unit size (2034819075 > 98454).\n' >&2;                    i=$((i+1)); done; printf 'done'",
+                FLOOD / 64
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+
+        let held = Arc::new(Mutex::new(String::new()));
+        let drain = drain_stderr(child.stderr.take().unwrap(), Arc::clone(&held));
+
+        // Without a concurrent drain the child blocks and this never returns.
+        let start = Instant::now();
+        let mut out = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut out).expect("read stdout");
+        let status = child.wait().expect("wait");
+        drain.join().expect("drain");
+
+        assert!(status.success(), "child should exit cleanly");
+        assert_eq!(out, "done", "stdout must still be readable past the flood");
+        assert!(start.elapsed() < Duration::from_secs(60), "took too long, likely blocked");
+
+        let kept = held.lock().unwrap();
+        assert!(kept.contains("Invalid NAL unit size"), "the tail is kept for the error message");
+        assert!(kept.len() <= STDERR_KEEP + 8192, "and it is bounded, got {}", kept.len());
     }
 }
